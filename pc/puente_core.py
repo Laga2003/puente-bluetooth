@@ -140,6 +140,8 @@ class Bridge:
         self._send_lock = threading.Lock()
         self._replies = queue.Queue()
         self._stop_typing = threading.Event()
+        self._steps = threading.Semaphore(0)
+        self.manual = False
         self._typing_thread = None
         self._state_lock = threading.Lock()
         self._next_prompt_id = 0
@@ -173,6 +175,7 @@ class Bridge:
         self._sock = sock
         threading.Thread(target=self._read_loop, args=(sock,), daemon=True).start()
         self.on_event("connected", None)
+        self._send({"t": "get_prompt"})
 
     def close(self):
         self.stop_typing()
@@ -194,6 +197,9 @@ class Bridge:
         with self._send_lock:
             sock.sendall(encode_frame(message))
 
+    def set_system_prompt(self, text):
+        self._send({"t": "set_prompt", "text": text})
+
     def send_prompt(self, text):
         self.stop_typing()
         with self._state_lock:
@@ -214,6 +220,8 @@ class Bridge:
                     self._replies.put(message)
                 elif kind == "ready":
                     self._on_ready(message)
+                elif kind == "prompt_value":
+                    self.on_event("prompt_value", (message.get("text", ""), bool(message.get("saved"))))
                 elif kind == "status":
                     self.on_event("status", message.get("text", ""))
                 elif kind == "error":
@@ -238,7 +246,11 @@ class Bridge:
             self._position = 0
         self.on_event("ready", self._response_len)
 
-    def start_typing(self):
+    def step(self):
+        """En modo manual, pide la siguiente letra."""
+        self._steps.release()
+
+    def start_typing(self, manual=False):
         """Empieza o continúa la escritura. Si ya había terminado, vuelve al principio."""
         if self.typing:
             return False
@@ -248,6 +260,8 @@ class Bridge:
                 return False
             if self._position >= self._response_len:
                 self._position = 0
+        self.manual = manual
+        self._steps = threading.Semaphore(0)
         self._stop_typing.clear()
         self._typing_thread = threading.Thread(target=self._type_loop, daemon=True)
         self._typing_thread.start()
@@ -282,10 +296,12 @@ class Bridge:
         with self._state_lock:
             response_id = self._response_id
         self._drain_replies()
-        self.on_event("typing_started", None)
+        self.on_event("typing_started", self.manual)
         reason = "stopped"
         try:
             while not self._stop_typing.is_set():
+                if self.manual and not self._steps.acquire(timeout=0.1):
+                    continue
                 seq = self._position
                 started = time.perf_counter()
                 self._send({"t": "next", "id": response_id, "seq": seq})
@@ -297,13 +313,15 @@ class Bridge:
                 char = reply["c"]
                 self.type_char(char)
                 self._position = seq + 1
-                pause_s = self.get_pause(rtt_ms)
-                self.on_event("latency", (seq, char, rtt_ms, pause_s * 1000))
+                pause_s = 0 if self.manual else self.get_pause(rtt_ms)
+                self.on_event("latency", (seq, char, rtt_ms, None if self.manual else pause_s * 1000))
                 if self._position >= self._response_len:
                     reason = "finished"
                     break
-                self._stop_typing.wait(pause_s)
+                if pause_s:
+                    self._stop_typing.wait(pause_s)
         except (OSError, queue.Empty, TimeoutError) as error:
             reason = "error"
             self.on_event("error", f"Escritura interrumpida: {error or 'sin respuesta del móvil'}")
+        self.manual = False
         self.on_event("typing_finished", reason)

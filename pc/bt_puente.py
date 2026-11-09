@@ -19,6 +19,7 @@ DEFAULT_CONFIG = {
     "mac": "",
     "delay_ms": 80,
     "auto_pace": True,
+    "manual_mode": False,
     "key_capture": "insert",
     "key_type": "delete",
     "key_stop": "space",
@@ -89,13 +90,19 @@ class Keys:
     KEY_DOWN = (0x100, 0x104)
     KEY_UP = (0x101, 0x105)
     INJECTED_FLAGS = 0x12
+    VK_ESCAPE = 0x1B
+    NO_LETTER_KEYS = {0x10, 0x11, 0x12, 0x14, 0x5B, 0x5C, 0x90, 0x91, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}
 
-    def __init__(self, bindings, is_locked, unlock_vk):
+    def __init__(self, bindings, is_locked, unlock_vk, is_manual, on_manual_key, stop_manual):
         """bindings: lista de (código de tecla, función que indica si está activa, acción).
 
         Mientras is_locked() sea cierto se bloquean las pulsaciones físicas,
-        salvo la tecla unlock_vk.
+        salvo la tecla unlock_vk. En modo manual, cada tecla pide una letra y Esc sale.
         """
+        self.is_manual = is_manual
+        self.on_manual_key = on_manual_key
+        self.stop_manual = stop_manual
+        self.manual_held = set()
         self.is_locked = is_locked
         self.unlock_vk = unlock_vk
         self.controller = keyboard.Controller()
@@ -130,6 +137,7 @@ class Keys:
 
     def _should_swallow(self, msg, vk):
         if msg in self.KEY_UP:
+            self.manual_held.discard(vk)
             if vk in self.swallowed:
                 self.swallowed.discard(vk)
                 return True
@@ -139,6 +147,8 @@ class Keys:
         if vk in self.swallowed:
             return True  # repetición por mantener la tecla pulsada
         locked = self.is_locked()
+        if locked and self.is_manual():
+            return self._handle_manual_key(vk)
         if locked and vk != self.unlock_vk:
             return True
         binding = self.bindings.get(vk)
@@ -150,6 +160,15 @@ class Keys:
         self.swallowed.add(vk)
         # El gancho de teclado no debe bloquearse: la acción va en su propio hilo.
         threading.Thread(target=action, daemon=True).start()
+        return True
+
+    def _handle_manual_key(self, vk):
+        if vk == self.VK_ESCAPE:
+            self.swallowed.add(vk)
+            threading.Thread(target=self.stop_manual, daemon=True).start()
+        elif vk not in self.NO_LETTER_KEYS and vk not in self.manual_held:
+            self.manual_held.add(vk)  # mantener una tecla pulsada solo cuenta una vez
+            self.on_manual_key()
         return True
 
     def wait_for_release(self, timeout=3.0):
@@ -185,11 +204,14 @@ class App:
         self.events = queue.Queue()
         self.delay_ms = self.config["delay_ms"]
         self.auto_pace = bool(self.config["auto_pace"])
+        self.manual_mode = bool(self.config["manual_mode"])
+        self.by_size = {}
         self.pace = Pace()
         self.latencies = []
         self.pauses = []
         self.log_lines = 0
         self.connecting = False
+        self.window_focused = False
 
         self.bridge = Bridge(
             on_event=lambda kind, data: self.events.put((kind, data)),
@@ -197,15 +219,20 @@ class App:
             get_pause=self._next_pause,
         )
         self.keys = Keys([
-            (self._key_code("key_capture"), lambda: self.bridge.connected, self.on_capture),
-            (self._key_code("key_type"), lambda: self.bridge.has_pending or self.bridge.typing, self.on_type),
+            (self._key_code("key_capture"), lambda: self.bridge.connected and not self.window_focused, self.on_capture),
+            (self._key_code("key_type"), lambda: self.bridge.has_pending and not self.window_focused, self.on_type),
             (self._key_code("key_stop"), lambda: self.bridge.typing, self.bridge.stop_typing),
-        ], is_locked=lambda: self.bridge.typing, unlock_vk=self._key_code("key_stop"))
+        ], is_locked=lambda: self.bridge.typing, unlock_vk=self._key_code("key_stop"),
+           is_manual=lambda: self.bridge.manual, on_manual_key=self.bridge.step,
+           stop_manual=self.bridge.stop_typing)
 
         self.root = tk.Tk()
         self.root.title("Puente Bluetooth")
-        self.root.geometry("440x560")
+        self.root.geometry("440x680")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        # Mientras se usa esta ventana, Insert y Supr deben funcionar con normalidad en ella.
+        self.root.bind("<FocusIn>", lambda _event: self._set_window_focused(True))
+        self.root.bind("<FocusOut>", lambda _event: self._set_window_focused(False))
         self._build_ui()
         self.keys.start()
         self.root.after(UI_REFRESH_MS, self._drain_events)
@@ -231,21 +258,36 @@ class App:
                 f"Parar: {self._pretty('key_stop')}")
         ttk.Label(frame, text=hint).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
+        ttk.Label(frame, text="Prompt del sistema").grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        prompt_frame = ttk.Frame(frame)
+        prompt_frame.grid(row=5, column=0, columnspan=2, sticky="ew")
+        prompt_frame.columnconfigure(0, weight=1)
+        self.prompt_box = tk.Text(prompt_frame, height=4, width=40, wrap="word", font=("Segoe UI", 9))
+        self.prompt_box.grid(row=0, column=0, sticky="ew")
+        prompt_scroll = ttk.Scrollbar(prompt_frame, command=self.prompt_box.yview)
+        prompt_scroll.grid(row=0, column=1, sticky="ns")
+        self.prompt_box.config(yscrollcommand=prompt_scroll.set)
+        ttk.Button(frame, text="Enviar prompt al móvil", command=self.on_send_prompt).grid(
+            row=6, column=0, columnspan=2, sticky="e", pady=(4, 0))
+
         self.delay_label = ttk.Label(frame, text=f"Pausa base entre letras: {self.delay_ms} ms")
-        self.delay_label.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.delay_label.grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
         scale = ttk.Scale(frame, from_=20, to=500, value=self.delay_ms, command=self.on_delay)
-        scale.grid(row=5, column=0, columnspan=2, sticky="ew")
+        scale.grid(row=8, column=0, columnspan=2, sticky="ew")
 
         self.auto_var = tk.BooleanVar(value=self.auto_pace)
         ttk.Checkbutton(frame, text="Ritmo automático e irregular", variable=self.auto_var,
-                        command=self.on_auto_toggle).grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
+                        command=self.on_auto_toggle).grid(row=9, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.manual_var = tk.BooleanVar(value=self.manual_mode)
+        ttk.Checkbutton(frame, text="Modo manual: cada tecla escribe una letra", variable=self.manual_var,
+                        command=self.on_manual_toggle).grid(row=10, column=0, columnspan=2, sticky="w")
 
         self.stats_var = tk.StringVar(value="Latencia (ida y vuelta): sin datos")
-        ttk.Label(frame, textvariable=self.stats_var, wraplength=410).grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 4))
+        ttk.Label(frame, textvariable=self.stats_var, wraplength=410).grid(row=11, column=0, columnspan=2, sticky="w", pady=(8, 4))
 
-        self.log = tk.Text(frame, height=16, width=40, state="disabled", font=("Consolas", 9))
-        self.log.grid(row=8, column=0, columnspan=2, sticky="nsew")
-        frame.rowconfigure(8, weight=1)
+        self.log = tk.Text(frame, height=12, width=40, state="disabled", font=("Consolas", 9))
+        self.log.grid(row=12, column=0, columnspan=2, sticky="nsew")
+        frame.rowconfigure(12, weight=1)
 
     def _key_name(self, setting):
         name = str(self.config[setting]).lower()
@@ -261,6 +303,29 @@ class App:
     def _next_pause(self, rtt_ms):
         base_s = self.delay_ms / 1000
         return self.pace.next_pause(base_s, rtt_ms) if self.auto_pace else base_s
+
+    def _set_window_focused(self, focused):
+        self.window_focused = focused
+
+    def on_send_prompt(self):
+        text = self.prompt_box.get("1.0", "end").strip()
+        if not self.bridge.connected:
+            self.state_var.set("Conecta primero con el móvil")
+            return
+        if not text:
+            self.state_var.set("El prompt no puede estar vacío")
+            return
+
+        def work():
+            try:
+                self.bridge.set_system_prompt(text)
+            except OSError as error:
+                self.events.put(("error", str(error)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_manual_toggle(self):
+        self.manual_mode = bool(self.manual_var.get())
 
     def on_auto_toggle(self):
         self.auto_pace = bool(self.auto_var.get())
@@ -313,7 +378,7 @@ class App:
     def on_type(self):
         self.keys.wait_for_release()
         self.pace.reset()
-        self.bridge.start_typing()
+        self.bridge.start_typing(manual=self.manual_mode)
 
     def _type_char(self, char):
         self.keys.type_char(char)
@@ -331,10 +396,15 @@ class App:
     def _update_stats(self):
         values = sorted(self.latencies)
         p95 = values[min(len(values) - 1, int(len(values) * 0.95))]
+        pause = f"   pausa media: {sum(self.pauses) / len(self.pauses):.0f} ms" if self.pauses else ""
+        sizes = "   ".join(
+            f"{size} B: {sum(items) / len(items):.1f} ms ({len(items)})"
+            for size, items in sorted(self.by_size.items())
+        )
         self.stats_var.set(
             f"Letras: {len(values)}   media: {sum(values) / len(values):.1f} ms   "
-            f"mín: {values[0]:.1f}   máx: {values[-1]:.1f}   p95: {p95:.1f}   "
-            f"pausa media: {sum(self.pauses) / len(self.pauses):.0f} ms"
+            f"mín: {values[0]:.1f}   máx: {values[-1]:.1f}   p95: {p95:.1f}{pause}\n"
+            f"Por tamaño:   {sizes}"
         )
 
     def _drain_events(self):
@@ -348,14 +418,21 @@ class App:
             if kind == "latency":
                 seq, char, rtt, pause = data
                 shown = {"\n": "⏎", "\t": "⇥", " ": "␠"}.get(char, char)
-                lines.append(f"#{seq + 1:<5} {shown:<2} {rtt:8.1f} ms  pausa {pause:5.0f} ms\n")
+                detail = "manual" if pause is None else f"pausa {pause:5.0f} ms"
+                lines.append(f"#{seq + 1:<5} {shown:<2} {rtt:8.1f} ms  {detail}\n")
                 self.latencies.append(rtt)
-                self.pauses.append(pause)
+                self.by_size.setdefault(len(char.encode("utf-8", "surrogatepass")), []).append(rtt)
+                if pause is not None:
+                    self.pauses.append(pause)
                 latency_changed = True
             elif kind == "typing_started":
                 self.latencies = []
                 self.pauses = []
-                self.state_var.set(f"Escribiendo… Teclado bloqueado: pulsa {self._pretty('key_stop')} para parar")
+                self.by_size = {}
+                if data:
+                    self.state_var.set("Modo manual: cada tecla escribe una letra. Pulsa Esc para salir")
+                else:
+                    self.state_var.set(f"Escribiendo… Teclado bloqueado: pulsa {self._pretty('key_stop')} para parar")
             elif kind == "typing_finished":
                 labels = {"finished": "Escritura terminada", "stopped": "Escritura parada", "error": "Escritura interrumpida"}
                 self.state_var.set(labels[data])
@@ -374,6 +451,12 @@ class App:
             elif kind == "prompt_sent":
                 preview = data if len(data) <= 60 else data[:60] + "…"
                 self.state_var.set(f"Enviado al móvil: {preview}")
+            elif kind == "prompt_value":
+                prompt, saved = data
+                self.prompt_box.delete("1.0", "end")
+                self.prompt_box.insert("1.0", prompt)
+                if saved:
+                    self.state_var.set("Prompt actualizado en el móvil")
             elif kind == "status":
                 self.state_var.set(data)
             elif kind == "ready":
@@ -389,6 +472,7 @@ class App:
     def on_close(self):
         self.config["delay_ms"] = self.delay_ms
         self.config["auto_pace"] = self.auto_pace
+        self.config["manual_mode"] = self.manual_mode
         save_config(self.config)
         self.keys.stop()
         self.bridge.close()
