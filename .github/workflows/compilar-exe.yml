@@ -1,0 +1,27 @@
+name: Compilar EXE
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Compilar
+        working-directory: pc
+        run: |
+          python -m pip install -r requirements.txt
+          pyinstaller --noconfirm --onefile --windowed --name PuenteBluetooth bt_puente.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PuenteBluetooth-exe
+          path: pc/dist/PuenteBluetooth.exe
+          if-no-files-found: error
