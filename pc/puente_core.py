@@ -1,14 +1,13 @@
 """Protocolo y lógica del puente Bluetooth. Sin interfaz ni teclado, para poder probarlo aparte.
 
 Cada mensaje es: 4 bytes con la longitud (big-endian) + JSON en UTF-8.
-Para escribir, el PC pide las letras de una en una ("next") y el móvil contesta
-con una sola letra ("char"). Así cada letra hace un viaje real por Bluetooth y el
+Para escribir, cada tecla pulsada hace que el PC pida una letra ("next") y el móvil
+conteste con esa letra ("char"). Así cada letra hace un viaje real por Bluetooth y el
 tiempo de ida y vuelta se mide con un único reloj, el del PC.
 """
 import json
 import os
 import queue
-import random
 import socket
 import struct
 import sys
@@ -86,62 +85,21 @@ def open_link(mac):
     return sock
 
 
-class Pace:
-    """Ritmo automático e irregular entre letras.
-
-    Combina tres cosas: fases de distinta velocidad, variación aleatoria en cada
-    letra y un freno que aumenta la pausa si la latencia sube.
-    """
-
-    PHASES = ((0.4, 0.3), (1.0, 0.5), (2.2, 0.2))  # (factor de pausa, probabilidad)
-    MIN_PAUSE_S = 0.02
-    MAX_PAUSE_S = 1.5
-
-    def __init__(self, rng=None):
-        self.rng = rng or random.Random()
-        self.reset()
-
-    def reset(self):
-        self._factor = 1.0
-        self._letters_left = 0
-        self._average_rtt = None
-        self._load = 1.0
-
-    def next_pause(self, base_s, rtt_ms):
-        if self._letters_left <= 0:
-            factors, weights = zip(*self.PHASES)
-            self._factor = self.rng.choices(factors, weights)[0]
-            self._letters_left = self.rng.randint(8, 30)
-        self._letters_left -= 1
-
-        if self._average_rtt is None:
-            self._average_rtt = rtt_ms
-        congested = rtt_ms > self._average_rtt * 1.5
-        self._load = min(4.0, self._load * 1.25) if congested else max(1.0, self._load * 0.97)
-        self._average_rtt = self._average_rtt * 0.9 + rtt_ms * 0.1
-
-        pause = base_s * self._factor * self.rng.uniform(0.6, 1.4) * self._load
-        return min(self.MAX_PAUSE_S, max(self.MIN_PAUSE_S, pause))
-
-
 class Bridge:
     """Mantiene la conexión con el móvil y escribe la respuesta letra a letra.
 
     on_event(tipo, datos) se llama desde hilos secundarios.
     type_char(c) escribe una letra en la ventana activa.
-    get_pause(rtt_ms) devuelve la pausa antes de la siguiente letra, en segundos.
     """
 
-    def __init__(self, on_event, type_char, get_pause):
+    def __init__(self, on_event, type_char):
         self.on_event = on_event
         self.type_char = type_char
-        self.get_pause = get_pause
         self._sock = None
         self._send_lock = threading.Lock()
         self._replies = queue.Queue()
         self._stop_typing = threading.Event()
         self._steps = threading.Semaphore(0)
-        self.manual = False
         self._typing_thread = None
         self._state_lock = threading.Lock()
         self._next_prompt_id = 0
@@ -247,10 +205,10 @@ class Bridge:
         self.on_event("ready", self._response_len)
 
     def step(self):
-        """En modo manual, pide la siguiente letra."""
+        """Pide la siguiente letra."""
         self._steps.release()
 
-    def start_typing(self, manual=False):
+    def start_typing(self):
         """Empieza o continúa la escritura. Si ya había terminado, vuelve al principio."""
         if self.typing:
             return False
@@ -260,7 +218,6 @@ class Bridge:
                 return False
             if self._position >= self._response_len:
                 self._position = 0
-        self.manual = manual
         self._steps = threading.Semaphore(0)
         self._stop_typing.clear()
         self._typing_thread = threading.Thread(target=self._type_loop, daemon=True)
@@ -296,11 +253,11 @@ class Bridge:
         with self._state_lock:
             response_id = self._response_id
         self._drain_replies()
-        self.on_event("typing_started", self.manual)
+        self.on_event("typing_started", None)
         reason = "stopped"
         try:
             while not self._stop_typing.is_set():
-                if self.manual and not self._steps.acquire(timeout=0.1):
+                if not self._steps.acquire(timeout=0.1):
                     continue
                 seq = self._position
                 started = time.perf_counter()
@@ -313,15 +270,11 @@ class Bridge:
                 char = reply["c"]
                 self.type_char(char)
                 self._position = seq + 1
-                pause_s = 0 if self.manual else self.get_pause(rtt_ms)
-                self.on_event("latency", (seq, char, rtt_ms, None if self.manual else pause_s * 1000))
+                self.on_event("latency", (seq, char, rtt_ms))
                 if self._position >= self._response_len:
                     reason = "finished"
                     break
-                if pause_s:
-                    self._stop_typing.wait(pause_s)
         except (OSError, queue.Empty, TimeoutError) as error:
             reason = "error"
             self.on_event("error", f"Escritura interrumpida: {error or 'sin respuesta del móvil'}")
-        self.manual = False
         self.on_event("typing_finished", reason)
