@@ -11,17 +11,27 @@ from tkinter import ttk
 import pyperclip
 from pynput import keyboard
 
-from puente_core import Bridge, open_link
+from puente_core import Bridge, Pace, open_link
 
 BASE_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 DEFAULT_CONFIG = {
     "mac": "",
     "delay_ms": 80,
-    "hotkey_capture": "<ctrl>+<alt>+c",
-    "hotkey_type": "<ctrl>+<alt>+v",
-    "hotkey_stop": "<ctrl>+<alt>+x",
+    "auto_pace": True,
+    "key_capture": "insert",
+    "key_type": "delete",
+    "key_stop": "space",
 }
+VK_CODES = {
+    "insert": 0x2D,
+    "delete": 0x2E,
+    "space": 0x20,
+    "pause": 0x13,
+    "scroll_lock": 0x91,
+    **{f"f{number}": 0x6F + number for number in range(1, 13)},
+}
+KEY_LABELS = {"insert": "Insert", "delete": "Supr", "space": "Espacio", "pause": "Pausa", "scroll_lock": "Bloq Despl"}
 MAX_LOG_LINES = 300
 UI_REFRESH_MS = 120
 
@@ -69,23 +79,34 @@ def paired_devices():
 
 
 class Keys:
-    """Atajos globales y simulación de teclado."""
+    """Teclas globales y simulación de teclado.
+
+    Cada tecla solo se reserva mientras su acción tiene sentido. El resto del
+    tiempo llega a la ventana activa y funciona con normalidad.
+    """
 
     MODIFIERS = {keyboard.Key.ctrl, keyboard.Key.alt, keyboard.Key.shift, keyboard.Key.cmd}
+    KEY_DOWN = (0x100, 0x104)
+    KEY_UP = (0x101, 0x105)
+    INJECTED_FLAGS = 0x12
 
-    def __init__(self, bindings):
+    def __init__(self, bindings, is_locked, unlock_vk):
+        """bindings: lista de (código de tecla, función que indica si está activa, acción).
+
+        Mientras is_locked() sea cierto se bloquean las pulsaciones físicas,
+        salvo la tecla unlock_vk.
+        """
+        self.is_locked = is_locked
+        self.unlock_vk = unlock_vk
         self.controller = keyboard.Controller()
         self.held = set()
-        # El gancho de teclado no debe bloquearse: cada acción va en su propio hilo.
-        self.hotkeys = [
-            keyboard.HotKey(keyboard.HotKey.parse(combo), self._spawn(action))
-            for combo, action in bindings
-        ]
-        self.listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
-
-    @staticmethod
-    def _spawn(action):
-        return lambda: threading.Thread(target=action, daemon=True).start()
+        self.swallowed = set()
+        self.bindings = {vk: (is_active, action) for vk, is_active, action in bindings}
+        self.listener = keyboard.Listener(
+            on_press=self._on_press,
+            on_release=self._on_release,
+            win32_event_filter=self._filter,
+        )
 
     def start(self):
         self.listener.start()
@@ -94,16 +115,42 @@ class Keys:
         self.listener.stop()
 
     def _on_press(self, key):
-        key = self.listener.canonical(key)
-        self.held.add(key)
-        for hotkey in self.hotkeys:
-            hotkey.press(key)
+        if key is not None:
+            self.held.add(self.listener.canonical(key))
 
     def _on_release(self, key):
-        key = self.listener.canonical(key)
-        self.held.discard(key)
-        for hotkey in self.hotkeys:
-            hotkey.release(key)
+        if key is not None:
+            self.held.discard(self.listener.canonical(key))
+
+    def _filter(self, msg, data):
+        # Las pulsaciones simuladas por el programa, como los espacios que escribe, se ignoran.
+        if not data.flags & self.INJECTED_FLAGS and self._should_swallow(msg, data.vkCode):
+            self.listener.suppress_event()
+        return True
+
+    def _should_swallow(self, msg, vk):
+        if msg in self.KEY_UP:
+            if vk in self.swallowed:
+                self.swallowed.discard(vk)
+                return True
+            return False
+        if msg not in self.KEY_DOWN:
+            return False
+        if vk in self.swallowed:
+            return True  # repetición por mantener la tecla pulsada
+        locked = self.is_locked()
+        if locked and vk != self.unlock_vk:
+            return True
+        binding = self.bindings.get(vk)
+        if binding is None or (self.held & self.MODIFIERS and not locked):
+            return False
+        is_active, action = binding
+        if not is_active():
+            return False
+        self.swallowed.add(vk)
+        # El gancho de teclado no debe bloquearse: la acción va en su propio hilo.
+        threading.Thread(target=action, daemon=True).start()
+        return True
 
     def wait_for_release(self, timeout=3.0):
         deadline = time.monotonic() + timeout
@@ -137,20 +184,23 @@ class App:
         self.config = load_config()
         self.events = queue.Queue()
         self.delay_ms = self.config["delay_ms"]
+        self.auto_pace = bool(self.config["auto_pace"])
+        self.pace = Pace()
         self.latencies = []
+        self.pauses = []
         self.log_lines = 0
         self.connecting = False
 
         self.bridge = Bridge(
             on_event=lambda kind, data: self.events.put((kind, data)),
             type_char=self._type_char,
-            get_delay=lambda: self.delay_ms / 1000,
+            get_pause=self._next_pause,
         )
         self.keys = Keys([
-            (self.config["hotkey_capture"], self.on_capture),
-            (self.config["hotkey_type"], self.on_type),
-            (self.config["hotkey_stop"], self.bridge.stop_typing),
-        ])
+            (self._key_code("key_capture"), lambda: self.bridge.connected, self.on_capture),
+            (self._key_code("key_type"), lambda: self.bridge.has_pending or self.bridge.typing, self.on_type),
+            (self._key_code("key_stop"), lambda: self.bridge.typing, self.bridge.stop_typing),
+        ], is_locked=lambda: self.bridge.typing, unlock_vk=self._key_code("key_stop"))
 
         self.root = tk.Tk()
         self.root.title("Puente Bluetooth")
@@ -176,25 +226,44 @@ class App:
         self.state_var = tk.StringVar(value="Sin conectar")
         ttk.Label(frame, textvariable=self.state_var, wraplength=410).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
-        hint = (f"Capturar: {self._pretty('hotkey_capture')}    "
-                f"Escribir: {self._pretty('hotkey_type')}    "
-                f"Parar: {self._pretty('hotkey_stop')}")
+        hint = (f"Capturar: {self._pretty('key_capture')}    "
+                f"Escribir: {self._pretty('key_type')}    "
+                f"Parar: {self._pretty('key_stop')}")
         ttk.Label(frame, text=hint).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
-        self.delay_label = ttk.Label(frame, text=f"Pausa entre letras: {self.delay_ms} ms")
+        self.delay_label = ttk.Label(frame, text=f"Pausa base entre letras: {self.delay_ms} ms")
         self.delay_label.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
         scale = ttk.Scale(frame, from_=20, to=500, value=self.delay_ms, command=self.on_delay)
         scale.grid(row=5, column=0, columnspan=2, sticky="ew")
 
+        self.auto_var = tk.BooleanVar(value=self.auto_pace)
+        ttk.Checkbutton(frame, text="Ritmo automático e irregular", variable=self.auto_var,
+                        command=self.on_auto_toggle).grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
         self.stats_var = tk.StringVar(value="Latencia (ida y vuelta): sin datos")
-        ttk.Label(frame, textvariable=self.stats_var, wraplength=410).grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 4))
+        ttk.Label(frame, textvariable=self.stats_var, wraplength=410).grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 4))
 
         self.log = tk.Text(frame, height=16, width=40, state="disabled", font=("Consolas", 9))
-        self.log.grid(row=7, column=0, columnspan=2, sticky="nsew")
-        frame.rowconfigure(7, weight=1)
+        self.log.grid(row=8, column=0, columnspan=2, sticky="nsew")
+        frame.rowconfigure(8, weight=1)
 
-    def _pretty(self, key):
-        return self.config[key].replace("<", "").replace(">", "").title()
+    def _key_name(self, setting):
+        name = str(self.config[setting]).lower()
+        return name if name in VK_CODES else DEFAULT_CONFIG[setting]
+
+    def _key_code(self, setting):
+        return VK_CODES[self._key_name(setting)]
+
+    def _pretty(self, setting):
+        name = self._key_name(setting)
+        return KEY_LABELS.get(name, name.upper())
+
+    def _next_pause(self, rtt_ms):
+        base_s = self.delay_ms / 1000
+        return self.pace.next_pause(base_s, rtt_ms) if self.auto_pace else base_s
+
+    def on_auto_toggle(self):
+        self.auto_pace = bool(self.auto_var.get())
 
     def _selected_mac(self):
         text = self.device_box.get().strip()
@@ -204,7 +273,7 @@ class App:
 
     def on_delay(self, value):
         self.delay_ms = int(float(value))
-        self.delay_label.config(text=f"Pausa entre letras: {self.delay_ms} ms")
+        self.delay_label.config(text=f"Pausa base entre letras: {self.delay_ms} ms")
 
     def on_connect(self):
         if self.connecting:
@@ -243,6 +312,7 @@ class App:
 
     def on_type(self):
         self.keys.wait_for_release()
+        self.pace.reset()
         self.bridge.start_typing()
 
     def _type_char(self, char):
@@ -263,7 +333,8 @@ class App:
         p95 = values[min(len(values) - 1, int(len(values) * 0.95))]
         self.stats_var.set(
             f"Letras: {len(values)}   media: {sum(values) / len(values):.1f} ms   "
-            f"mín: {values[0]:.1f}   máx: {values[-1]:.1f}   p95: {p95:.1f}"
+            f"mín: {values[0]:.1f}   máx: {values[-1]:.1f}   p95: {p95:.1f}   "
+            f"pausa media: {sum(self.pauses) / len(self.pauses):.0f} ms"
         )
 
     def _drain_events(self):
@@ -275,14 +346,16 @@ class App:
             except queue.Empty:
                 break
             if kind == "latency":
-                seq, char, rtt = data
+                seq, char, rtt, pause = data
                 shown = {"\n": "⏎", "\t": "⇥", " ": "␠"}.get(char, char)
-                lines.append(f"#{seq + 1:<5} {shown:<2} {rtt:8.1f} ms\n")
+                lines.append(f"#{seq + 1:<5} {shown:<2} {rtt:8.1f} ms  pausa {pause:5.0f} ms\n")
                 self.latencies.append(rtt)
+                self.pauses.append(pause)
                 latency_changed = True
             elif kind == "typing_started":
                 self.latencies = []
-                self.state_var.set("Escribiendo…")
+                self.pauses = []
+                self.state_var.set(f"Escribiendo… Teclado bloqueado: pulsa {self._pretty('key_stop')} para parar")
             elif kind == "typing_finished":
                 labels = {"finished": "Escritura terminada", "stopped": "Escritura parada", "error": "Escritura interrumpida"}
                 self.state_var.set(labels[data])
@@ -315,6 +388,7 @@ class App:
 
     def on_close(self):
         self.config["delay_ms"] = self.delay_ms
+        self.config["auto_pace"] = self.auto_pace
         save_config(self.config)
         self.keys.stop()
         self.bridge.close()

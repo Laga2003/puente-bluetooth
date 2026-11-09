@@ -8,6 +8,7 @@ tiempo de ida y vuelta se mide con un único reloj, el del PC.
 import json
 import os
 import queue
+import random
 import socket
 import struct
 import sys
@@ -85,18 +86,56 @@ def open_link(mac):
     return sock
 
 
+class Pace:
+    """Ritmo automático e irregular entre letras.
+
+    Combina tres cosas: fases de distinta velocidad, variación aleatoria en cada
+    letra y un freno que aumenta la pausa si la latencia sube.
+    """
+
+    PHASES = ((0.4, 0.3), (1.0, 0.5), (2.2, 0.2))  # (factor de pausa, probabilidad)
+    MIN_PAUSE_S = 0.02
+    MAX_PAUSE_S = 1.5
+
+    def __init__(self, rng=None):
+        self.rng = rng or random.Random()
+        self.reset()
+
+    def reset(self):
+        self._factor = 1.0
+        self._letters_left = 0
+        self._average_rtt = None
+        self._load = 1.0
+
+    def next_pause(self, base_s, rtt_ms):
+        if self._letters_left <= 0:
+            factors, weights = zip(*self.PHASES)
+            self._factor = self.rng.choices(factors, weights)[0]
+            self._letters_left = self.rng.randint(8, 30)
+        self._letters_left -= 1
+
+        if self._average_rtt is None:
+            self._average_rtt = rtt_ms
+        congested = rtt_ms > self._average_rtt * 1.5
+        self._load = min(4.0, self._load * 1.25) if congested else max(1.0, self._load * 0.97)
+        self._average_rtt = self._average_rtt * 0.9 + rtt_ms * 0.1
+
+        pause = base_s * self._factor * self.rng.uniform(0.6, 1.4) * self._load
+        return min(self.MAX_PAUSE_S, max(self.MIN_PAUSE_S, pause))
+
+
 class Bridge:
     """Mantiene la conexión con el móvil y escribe la respuesta letra a letra.
 
     on_event(tipo, datos) se llama desde hilos secundarios.
     type_char(c) escribe una letra en la ventana activa.
-    get_delay() devuelve la pausa entre letras, en segundos.
+    get_pause(rtt_ms) devuelve la pausa antes de la siguiente letra, en segundos.
     """
 
-    def __init__(self, on_event, type_char, get_delay):
+    def __init__(self, on_event, type_char, get_pause):
         self.on_event = on_event
         self.type_char = type_char
-        self.get_delay = get_delay
+        self.get_pause = get_pause
         self._sock = None
         self._send_lock = threading.Lock()
         self._replies = queue.Queue()
@@ -116,6 +155,11 @@ class Bridge:
     def typing(self):
         thread = self._typing_thread
         return thread is not None and thread.is_alive()
+
+    @property
+    def has_pending(self):
+        """Hay una respuesta recibida que aún no se ha escrito entera."""
+        return self._response_id is not None and self._position < self._response_len
 
     def attach(self, sock):
         """Hace el saludo sobre un socket ya abierto y empieza a escuchar."""
@@ -253,11 +297,12 @@ class Bridge:
                 char = reply["c"]
                 self.type_char(char)
                 self._position = seq + 1
-                self.on_event("latency", (seq, char, rtt_ms))
+                pause_s = self.get_pause(rtt_ms)
+                self.on_event("latency", (seq, char, rtt_ms, pause_s * 1000))
                 if self._position >= self._response_len:
                     reason = "finished"
                     break
-                self._stop_typing.wait(self.get_delay())
+                self._stop_typing.wait(pause_s)
         except (OSError, queue.Empty, TimeoutError) as error:
             reason = "error"
             self.on_event("error", f"Escritura interrumpida: {error or 'sin respuesta del móvil'}")
