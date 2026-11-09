@@ -4,21 +4,24 @@ import android.Manifest;
 import android.app.Activity;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothManager;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.text.InputType;
-import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
-public class MainActivity extends Activity implements BridgeServer.Listener, BridgeServer.Settings {
-    private static final int REQUEST_BLUETOOTH = 1;
-    private static final String DEFAULT_PROMPT =
+import java.util.ArrayList;
+import java.util.List;
+
+public class MainActivity extends Activity implements BridgeServer.Listener {
+    private static final int REQUEST_PERMISSIONS = 1;
+    static final String DEFAULT_PROMPT =
             "Devuelve únicamente lo que se pide en el texto que recibas, "
                     + "sin introducciones, comentarios, explicaciones ni despedidas. "
                     + "Si se pide escribir algo, escribe solo ese contenido. "
@@ -30,14 +33,11 @@ public class MainActivity extends Activity implements BridgeServer.Listener, Bri
     private EditText promptField;
     private TextView logView;
     private Button startButton;
-    private BridgeServer server;
-    private volatile String apiKey = "";
-    private volatile String systemPrompt = DEFAULT_PROMPT;
+    private Button stopButton;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         preferences = getSharedPreferences("ajustes", MODE_PRIVATE);
 
         int padding = Math.round(16 * getResources().getDisplayMetrics().density);
@@ -58,9 +58,13 @@ public class MainActivity extends Activity implements BridgeServer.Listener, Bri
         layout.addView(promptField);
 
         startButton = new Button(this);
-        startButton.setText("Iniciar servidor");
         startButton.setOnClickListener(view -> onStartPressed());
         layout.addView(startButton);
+
+        stopButton = new Button(this);
+        stopButton.setText("Detener servidor");
+        stopButton.setOnClickListener(view -> onStopPressed());
+        layout.addView(stopButton);
 
         logView = new TextView(this);
         ScrollView scroll = new ScrollView(this);
@@ -70,29 +74,59 @@ public class MainActivity extends Activity implements BridgeServer.Listener, Bri
         setContentView(layout);
     }
 
+    @Override
+    protected void onResume() {
+        super.onResume();
+        logView.setText("");
+        BridgeService.attachLog(this);
+        showRunning(BridgeService.isRunning());
+    }
+
+    @Override
+    protected void onPause() {
+        BridgeService.attachLog(null);
+        super.onPause();
+    }
+
     private TextView label(String text) {
         TextView view = new TextView(this);
         view.setText(text);
         return view;
     }
 
-    private void onStartPressed() {
-        apiKey = apiKeyField.getText().toString().trim();
-        systemPrompt = promptField.getText().toString().trim();
-        preferences.edit().putString("api_key", apiKey).putString("prompt", systemPrompt).apply();
+    private void showRunning(boolean running) {
+        startButton.setText(running ? "Guardar ajustes" : "Iniciar servidor");
+        stopButton.setEnabled(running);
+    }
 
-        if (Build.VERSION.SDK_INT >= 31
-                && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{Manifest.permission.BLUETOOTH_CONNECT}, REQUEST_BLUETOOTH);
+    private void onStartPressed() {
+        preferences.edit()
+                .putString("api_key", apiKeyField.getText().toString().trim())
+                .putString("prompt", promptField.getText().toString().trim())
+                .apply();
+
+        List<String> missing = new ArrayList<>();
+        if (Build.VERSION.SDK_INT >= 31 && !hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) {
+            missing.add(Manifest.permission.BLUETOOTH_CONNECT);
+        }
+        if (Build.VERSION.SDK_INT >= 33 && !hasPermission(Manifest.permission.POST_NOTIFICATIONS)) {
+            missing.add(Manifest.permission.POST_NOTIFICATIONS);
+        }
+        if (!missing.isEmpty()) {
+            requestPermissions(missing.toArray(new String[0]), REQUEST_PERMISSIONS);
             return;
         }
         startServer();
     }
 
+    private boolean hasPermission(String permission) {
+        return checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED;
+    }
+
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
-        if (requestCode != REQUEST_BLUETOOTH) return;
-        if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) {
+        if (requestCode != REQUEST_PERMISSIONS) return;
+        if (Build.VERSION.SDK_INT < 31 || hasPermission(Manifest.permission.BLUETOOTH_CONNECT)) {
             startServer();
         } else {
             onLog("Sin permiso de Bluetooth no se puede iniciar el servidor");
@@ -100,7 +134,7 @@ public class MainActivity extends Activity implements BridgeServer.Listener, Bri
     }
 
     private void startServer() {
-        if (server != null) {
+        if (BridgeService.isRunning()) {
             onLog("Ajustes guardados");
             return;
         }
@@ -110,29 +144,22 @@ public class MainActivity extends Activity implements BridgeServer.Listener, Bri
             onLog("Activa el Bluetooth y vuelve a intentarlo");
             return;
         }
-        server = new BridgeServer(adapter, new GroqClient(GroqClient.DEFAULT_URL), this, this);
-        server.start();
-        startButton.setText("Guardar ajustes");
+        Intent service = new Intent(this, BridgeService.class);
+        if (Build.VERSION.SDK_INT >= 26) {
+            startForegroundService(service);
+        } else {
+            startService(service);
+        }
+        showRunning(true);
     }
 
-    @Override
-    public String apiKey() {
-        return apiKey;
-    }
-
-    @Override
-    public String systemPrompt() {
-        return systemPrompt;
+    private void onStopPressed() {
+        stopService(new Intent(this, BridgeService.class));
+        showRunning(false);
     }
 
     @Override
     public void onLog(String message) {
         runOnUiThread(() -> logView.append(message + "\n"));
-    }
-
-    @Override
-    protected void onDestroy() {
-        if (server != null) server.stop();
-        super.onDestroy();
     }
 }
