@@ -26,6 +26,7 @@ final class BridgeServer {
     interface Settings {
         String apiKey();
         String systemPrompt();
+        void setSystemPrompt(String prompt);
     }
 
     private static final UUID SERVICE_UUID = UUID.fromString("7c1d6f2a-4b7e-4f0e-9a55-2e6b8c3d1a90");
@@ -113,9 +114,26 @@ final class BridgeServer {
             case "next":
                 sendLetter(message.getInt("id"), message.getInt("seq"));
                 break;
+            case "get_prompt":
+                sendPrompt(false);
+                break;
+            case "set_prompt":
+                String prompt = message.getString("text").trim();
+                if (prompt.isEmpty()) {
+                    send(new JSONObject().put("t", "error").put("text", "El prompt no puede estar vacío"));
+                } else {
+                    settings.setSystemPrompt(prompt);
+                    listener.onLog("Prompt actualizado desde el PC");
+                    sendPrompt(true);
+                }
+                break;
             default:
                 break;
         }
+    }
+
+    private void sendPrompt(boolean saved) throws IOException, JSONException {
+        send(new JSONObject().put("t", "prompt_value").put("text", settings.systemPrompt()).put("saved", saved));
     }
 
     private void sendLetter(int id, int seq) throws IOException, JSONException {

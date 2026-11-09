@@ -19,7 +19,8 @@ import android.widget.TextView;
 import java.util.ArrayList;
 import java.util.List;
 
-public class MainActivity extends Activity implements BridgeServer.Listener {
+public class MainActivity extends Activity
+        implements BridgeServer.Listener, SharedPreferences.OnSharedPreferenceChangeListener {
     private static final int REQUEST_PERMISSIONS = 1;
     static final String DEFAULT_PROMPT =
             "Devuelve únicamente lo que se pide en el texto que recibas, "
@@ -34,6 +35,7 @@ public class MainActivity extends Activity implements BridgeServer.Listener {
     private TextView logView;
     private Button startButton;
     private Button stopButton;
+    private String lastSavedPrompt;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -54,7 +56,8 @@ public class MainActivity extends Activity implements BridgeServer.Listener {
         layout.addView(label("Prompt del sistema"));
         promptField = new EditText(this);
         promptField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
-        promptField.setText(preferences.getString("prompt", DEFAULT_PROMPT));
+        lastSavedPrompt = preferences.getString("prompt", DEFAULT_PROMPT);
+        promptField.setText(lastSavedPrompt);
         layout.addView(promptField);
 
         startButton = new Button(this);
@@ -67,11 +70,11 @@ public class MainActivity extends Activity implements BridgeServer.Listener {
         layout.addView(stopButton);
 
         logView = new TextView(this);
-        ScrollView scroll = new ScrollView(this);
-        scroll.addView(logView);
-        layout.addView(scroll, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        layout.addView(logView);
 
-        setContentView(layout);
+        ScrollView page = new ScrollView(this);
+        page.addView(layout);
+        setContentView(page);
     }
 
     @Override
@@ -80,12 +83,31 @@ public class MainActivity extends Activity implements BridgeServer.Listener {
         logView.setText("");
         BridgeService.attachLog(this);
         showRunning(BridgeService.isRunning());
+        preferences.registerOnSharedPreferenceChangeListener(this);
+        syncPrompt();
     }
 
     @Override
     protected void onPause() {
         BridgeService.attachLog(null);
+        preferences.unregisterOnSharedPreferenceChangeListener(this);
         super.onPause();
+    }
+
+    @Override
+    public void onSharedPreferenceChanged(SharedPreferences changed, String key) {
+        if ("prompt".equals(key)) {
+            syncPrompt();
+        }
+    }
+
+    /** Muestra un prompt llegado del PC sin pisar lo que se esté escribiendo aquí. */
+    private void syncPrompt() {
+        String saved = preferences.getString("prompt", DEFAULT_PROMPT);
+        if (!saved.equals(lastSavedPrompt)) {
+            lastSavedPrompt = saved;
+            promptField.setText(saved);
+        }
     }
 
     private TextView label(String text) {
@@ -100,9 +122,10 @@ public class MainActivity extends Activity implements BridgeServer.Listener {
     }
 
     private void onStartPressed() {
+        lastSavedPrompt = promptField.getText().toString().trim();
         preferences.edit()
                 .putString("api_key", apiKeyField.getText().toString().trim())
-                .putString("prompt", promptField.getText().toString().trim())
+                .putString("prompt", lastSavedPrompt)
                 .apply();
 
         List<String> missing = new ArrayList<>();

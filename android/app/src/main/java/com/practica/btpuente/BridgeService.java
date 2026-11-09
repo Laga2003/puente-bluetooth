@@ -114,6 +114,11 @@ public class BridgeService extends Service implements BridgeServer.Listener, Bri
     }
 
     @Override
+    public void setSystemPrompt(String prompt) {
+        preferences.edit().putString("prompt", prompt).apply();
+    }
+
+    @Override
     public void onLog(String message) {
         addLog(message);
     }
