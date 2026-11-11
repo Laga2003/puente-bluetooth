@@ -20,7 +20,7 @@ DEFAULT_CONFIG = {
     "show_latency": True,
     "key_capture": "insert",
     "key_type": "delete",
-    "key_stop": "space",
+    "key_stop": "right_shift",
 }
 VK_CODES = {
     "insert": 0x2D,
@@ -28,9 +28,34 @@ VK_CODES = {
     "space": 0x20,
     "pause": 0x13,
     "scroll_lock": 0x91,
+    "right_shift": 0xA1,
     **{f"f{number}": 0x6F + number for number in range(1, 13)},
 }
-KEY_LABELS = {"insert": "Insert", "delete": "Supr", "space": "Espacio", "pause": "Pausa", "scroll_lock": "Bloq Despl"}
+VK_LABELS = {
+    0x08: "Retroceso", 0x09: "Tab", 0x0D: "Intro", 0x13: "Pausa", 0x14: "Bloq Mayús",
+    0x20: "Espacio", 0x21: "Re Pág", 0x22: "Av Pág", 0x23: "Fin", 0x24: "Inicio",
+    0x25: "Flecha izquierda", 0x26: "Flecha arriba", 0x27: "Flecha derecha", 0x28: "Flecha abajo",
+    0x2D: "Insert", 0x2E: "Supr", 0x5D: "Menú", 0x91: "Bloq Despl",
+    0xA0: "Mayús izquierda", 0xA1: "Mayús derecha", 0xA2: "Ctrl izquierdo", 0xA3: "Ctrl derecho",
+    0xA4: "Alt", 0xA5: "Alt Gr",
+    **{0x6F + number: f"F{number}" for number in range(1, 13)},
+}
+VK_ESCAPE = 0x1B
+
+
+def key_label(vk):
+    """Nombre legible de una tecla a partir de su código virtual."""
+    if vk in VK_LABELS:
+        return VK_LABELS[vk]
+    if sys.platform == "win32":
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        scan = user32.MapVirtualKeyW(vk, 0)
+        buffer = ctypes.create_unicode_buffer(32)
+        if scan and user32.GetKeyNameTextW(scan << 16, buffer, 32):
+            return buffer.value
+    return f"Tecla {vk}"
 MAX_LOG_LINES = 300
 UI_REFRESH_MS = 120
 
@@ -101,6 +126,7 @@ class Keys:
         self.letter_held = set()
         self.is_locked = is_locked
         self.unlock_vk = unlock_vk
+        self.capture_callback = None
         self.controller = keyboard.Controller()
         self.held = set()
         self.swallowed = set()
@@ -142,6 +168,11 @@ class Keys:
             return False
         if vk in self.swallowed:
             return True  # repetición por mantener la tecla pulsada
+        if self.capture_callback is not None:
+            callback, self.capture_callback = self.capture_callback, None
+            self.swallowed.add(vk)
+            callback(vk)
+            return True
         if self.is_locked():
             return self._handle_session_key(vk)
         binding = self.bindings.get(vk)
@@ -163,6 +194,10 @@ class Keys:
             self.letter_held.add(vk)  # mantener una tecla pulsada solo cuenta una vez
             self.on_letter_key()
         return True
+
+    def capture_next(self, callback):
+        """La siguiente tecla física se entrega a callback en lugar de a la ventana activa."""
+        self.capture_callback = callback
 
     def wait_for_release(self, timeout=3.0):
         deadline = time.monotonic() + timeout
@@ -238,10 +273,11 @@ class App:
         self.state_var = tk.StringVar(value="Sin conectar")
         ttk.Label(frame, textvariable=self.state_var, wraplength=410).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
-        hint = (f"Capturar: {self._pretty('key_capture')}    "
-                f"Escribir: {self._pretty('key_type')}    "
-                f"Parar: {self._pretty('key_stop')}")
-        ttk.Label(frame, text=hint).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.hint_var = tk.StringVar()
+        ttk.Label(frame, textvariable=self.hint_var).grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Button(frame, text="Cambiar tecla de parar", command=self.on_rebind_stop).grid(
+            row=3, column=1, sticky="e", pady=(8, 0))
+        self._update_hint()
 
         ttk.Label(frame, text="Prompt del sistema").grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
         prompt_frame = ttk.Frame(frame)
@@ -281,16 +317,26 @@ class App:
         self.root.update_idletasks()
         self.root.geometry(f"440x{self.root.winfo_reqheight()}")
 
-    def _key_name(self, setting):
-        name = str(self.config[setting]).lower()
-        return name if name in VK_CODES else DEFAULT_CONFIG[setting]
-
     def _key_code(self, setting):
-        return VK_CODES[self._key_name(setting)]
+        value = self.config[setting]
+        if isinstance(value, int) and 0 < value < 256 and value != VK_ESCAPE:
+            return value
+        return VK_CODES.get(str(value).lower(), VK_CODES[DEFAULT_CONFIG[setting]])
 
     def _pretty(self, setting):
-        name = self._key_name(setting)
-        return KEY_LABELS.get(name, name.upper())
+        return key_label(self._key_code(setting))
+
+    def _update_hint(self):
+        self.hint_var.set(f"Capturar: {self._pretty('key_capture')}    "
+                          f"Escribir: {self._pretty('key_type')}    "
+                          f"Parar: {self._pretty('key_stop')}")
+
+    def on_rebind_stop(self):
+        if self.bridge.typing:
+            self.state_var.set("Para la escritura antes de cambiar la tecla")
+            return
+        self.state_var.set("Pulsa la tecla que quieras usar para parar (Esc cancela)")
+        self.keys.capture_next(lambda vk: self.events.put(("key_captured", vk)))
 
     def _set_window_focused(self, focused):
         self.window_focused = focused
@@ -420,6 +466,15 @@ class App:
             elif kind == "prompt_sent":
                 preview = data if len(data) <= 60 else data[:60] + "…"
                 self.state_var.set(f"Enviado al móvil: {preview}")
+            elif kind == "key_captured":
+                if data == VK_ESCAPE:
+                    self.state_var.set("Cambio de tecla cancelado")
+                else:
+                    self.config["key_stop"] = data
+                    self.keys.unlock_vk = data
+                    save_config(self.config)
+                    self._update_hint()
+                    self.state_var.set(f"Tecla de parar: {key_label(data)}")
             elif kind == "prompt_value":
                 prompt, saved = data
                 self.prompt_box.delete("1.0", "end")
